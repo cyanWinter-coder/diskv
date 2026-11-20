@@ -178,6 +178,32 @@ diskv also now provides ReadStream and WriteStream methods, to allow very large
 data to be handled efficiently.
 
 
+## Atomic batch writes
+
+WriteBatch (and its streaming counterpart WriteBatchStream) writes multiple
+keys as one atomic, index-coupled batch. Every data block is written to a
+recoverable temporary file and synced before the in-memory cache, the on-disk
+index or any final data file is touched. The batch either commits in full or
+not at all: on failure all temporary files are removed and a `*BatchError`
+reports the offending key and reason, while every pre-existing index entry
+stays unchanged.
+
+```go
+err := d.WriteBatch("import-2026-11-21", []diskv.BatchItem{
+    {Key: "a", Val: []byte("1")},
+    {Key: "b", Val: []byte("2")},
+})
+```
+
+Batch IDs make retries idempotent: re-submitting a batch ID that already
+committed is a no-op, including after a process restart. Interrupted batches
+are resolved automatically when the store is reopened — uncommitted blocks are
+rolled back, committed blocks are rolled forward — and the staging directory
+is never visible through Keys or Read. Concurrent updates to the same key are
+serialized by a generation counter, so readers only ever observe the complete
+old value or the complete new value, never a partial one.
+
+
 # Future plans
 
  * Needs plenty of robust testing: huge datasets, etc...

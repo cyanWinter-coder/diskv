@@ -96,6 +96,13 @@ type Diskv struct {
 	mu        sync.RWMutex
 	cache     map[string][]byte
 	cacheSize uint64
+	// gen is the global mutation generation; keyGen records the generation a
+	// key last changed at. A cache backfill from a read is only accepted when
+	// the generation it observed still matches, so stale readers can never
+	// repopulate an overwritten or erased value.
+	gen              uint64
+	keyGen           map[string]uint64
+	completedBatches map[string]struct{}
 }
 
 // New returns an initialized Diskv structure, ready to use.
@@ -129,9 +136,19 @@ func New(o Options) *Diskv {
 	}
 
 	d := &Diskv{
-		Options:   o,
-		cache:     map[string][]byte{},
-		cacheSize: 0,
+		Options:          o,
+		cache:            map[string][]byte{},
+		cacheSize:        0,
+		keyGen:           map[string]uint64{},
+		completedBatches: map[string]struct{}{},
+	}
+
+	// Resolve interrupted batch writes before the index is rebuilt, so the
+	// index only ever sees complete data files.
+	if err := d.recoverBatches(); err != nil {
+		// Recovery is best effort: leftovers stay in the staging tree, which
+		// Keys() ignores, and the store continues with a consistent view.
+		_ = err
 	}
 
 	if d.Index != nil && d.IndexLess != nil {
@@ -281,6 +298,7 @@ func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) er
 		d.Index.Insert(pathKey.originalKey)
 	}
 
+	d.touchGenerationWithLock(pathKey.originalKey)
 	d.bustCacheWithLock(pathKey.originalKey) // cache only on read
 
 	return nil
@@ -312,6 +330,10 @@ func (d *Diskv) Import(srcFilename, dstKey string, move bool) (err error) {
 	if move {
 		if err := syscall.Rename(srcFilename, d.completeFilename(dstPathKey)); err == nil {
 			d.bustCacheWithLock(dstPathKey.originalKey)
+			d.touchGenerationWithLock(dstPathKey.originalKey)
+			if d.Index != nil {
+				d.Index.Insert(dstPathKey.originalKey)
+			}
 			return nil
 		} else if err != syscall.EXDEV {
 			// If it failed due to being on a different device, fall back to copying
@@ -443,21 +465,26 @@ func (cr closingReader) Read(p []byte) (int, error) {
 // siphon is like a TeeReader: it copies all data read through it to an
 // internal buffer, and moves that buffer to the cache at EOF.
 type siphon struct {
-	f   *os.File
-	d   *Diskv
-	key string
-	buf *bytes.Buffer
+	f      *os.File
+	d      *Diskv
+	key    string
+	gen    uint64
+	keyGen uint64
+	buf    *bytes.Buffer
 }
 
 // newSiphon constructs a siphoning reader that represents the passed file.
 // When a successful series of reads ends in an EOF, the siphon will write
-// the buffered data to Diskv's cache under the given key.
+// the buffered data to Diskv's cache under the given key, provided the key was
+// not overwritten or erased while the read was in flight.
 func newSiphon(f *os.File, d *Diskv, key string) io.Reader {
 	return &siphon{
-		f:   f,
-		d:   d,
-		key: key,
-		buf: &bytes.Buffer{},
+		f:      f,
+		d:      d,
+		key:    key,
+		gen:    d.gen,
+		keyGen: d.keyGen[key],
+		buf:    &bytes.Buffer{},
 	}
 }
 
@@ -470,7 +497,7 @@ func (s *siphon) Read(p []byte) (int, error) {
 	}
 
 	if err == io.EOF {
-		s.d.cacheWithoutLock(s.key, s.buf.Bytes()) // cache may fail
+		s.d.cacheFromRead(s.key, s.buf.Bytes(), s.gen, s.keyGen) // cache may fail
 		if closeErr := s.f.Close(); closeErr != nil {
 			return n, closeErr // close must succeed for Read to succeed
 		}
@@ -487,6 +514,7 @@ func (d *Diskv) Erase(key string) error {
 	defer d.mu.Unlock()
 
 	d.bustCacheWithLock(key)
+	d.touchGenerationWithLock(key)
 
 	// erase from index
 	if d.Index != nil {
@@ -521,6 +549,9 @@ func (d *Diskv) EraseAll() error {
 	defer d.mu.Unlock()
 	d.cache = make(map[string][]byte)
 	d.cacheSize = 0
+	d.gen++
+	d.keyGen = map[string]uint64{}
+	d.completedBatches = map[string]struct{}{}
 	if d.TempDir != "" {
 		os.RemoveAll(d.TempDir) // errors ignored
 	}
@@ -585,6 +616,20 @@ func (d *Diskv) walker(c chan<- string, prefix string, cancel <-chan struct{}) f
 		}
 
 		relPath, _ := filepath.Rel(d.BasePath, path)
+
+		// Never expose batch staging internals (temporary blocks, backups,
+		// checkpoints) as keys. When TempDir is set, staging lives outside
+		// BasePath and won't be walked at all.
+		if firstPathSegment(relPath) == batchStagingDirName {
+			if info.IsDir() && filepath.Clean(path) != filepath.Clean(d.BasePath) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !info.IsDir() && strings.HasSuffix(info.Name(), batchTempSuffix) {
+			return nil
+		}
+
 		dir, file := filepath.Split(relPath)
 		pathSplit := strings.Split(dir, string(filepath.Separator))
 		pathSplit = pathSplit[:len(pathSplit)-1]
@@ -648,10 +693,23 @@ func (d *Diskv) cacheWithLock(key string, val []byte) error {
 	return nil
 }
 
-// cacheWithoutLock acquires the store's (write) mutex and calls cacheWithLock.
-func (d *Diskv) cacheWithoutLock(key string, val []byte) error {
+// touchGenerationWithLock advances the global mutation generation and records
+// the key's new generation, invalidating any in-flight read of the key.
+func (d *Diskv) touchGenerationWithLock(key string) {
+	d.gen++
+	d.keyGen[key] = d.gen
+}
+
+// cacheFromRead backfills the cache from a completed read, but only when the
+// key's generation still matches what the read observed. A write, batch commit
+// or erase racing the read would have advanced it, and the buffered bytes would
+// be stale.
+func (d *Diskv) cacheFromRead(key string, val []byte, gen, keyGen uint64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.gen != gen || d.keyGen[key] != keyGen {
+		return nil // superseded; drop the buffered value
+	}
 	return d.cacheWithLock(key, val)
 }
 
